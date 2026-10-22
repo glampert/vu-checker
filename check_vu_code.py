@@ -39,8 +39,14 @@ LABEL  = re.compile(r'^([A-Za-z_][\w.]*):\s*$')
 REG    = re.compile(r'\b(VI\d\d|VF\d\d)([xyzw]?)\b')
 
 def split_op(text):
-    """'maddw.xyzw VF09, VF04, VF00w' -> ('maddw', 'xyzw', ['VF09', 'VF04', 'VF00w'])."""
-    head, _, rest = text.partition(' ')
+    """'maddw.xyzw VF09, VF04, VF00w' -> ('maddw', 'xyzw', ['VF09', 'VF04', 'VF00w']).
+
+    Source lines come through here too (see source_name), and those are indented
+    with tabs as often as spaces: the split is on any whitespace.
+    """
+    parts = text.strip().split(None, 1)
+    head = parts[0] if parts else ''
+    rest = parts[1] if len(parts) > 1 else ''
     op, _, mask = head.partition('.')
     ops = [t.strip() for t in rest.split(',')] if rest.strip() else []
     return op.lower().replace('[e]', ''), mask.lower().replace('[e]', ''), ops
@@ -153,6 +159,8 @@ def check_crossloop(prog):
 #  regalloc
 # ---------------------------------------------------------------------------
 
+MR32_SOURCE = {'x': 'y', 'y': 'z', 'z': 'w', 'w': 'x'}
+
 def same_instructions(a, b):
     """The two programs are one instruction stream once whole-nop pairs are dropped."""
     def stream(pairs):
@@ -189,8 +197,16 @@ def operands(text):
                 reads.append(r)
             elif r and r[0] != 'VF00':
                 (reads if op == 'sqi' else writes).append(r)
-    elif op == 'fcand' or op in ('fcor', 'fcget', 'fmand', 'fmor', 'fsand', 'fsor'):
-        writes.append(('VI01', 'x'))
+    elif op in ('fcand', 'fcor', 'fceq'):
+        writes.append(('VI01', 'x'))          # the clip flag tests' fixed destination
+    elif op in ('fcget', 'fsand', 'fsor', 'fseq', 'fmand', 'fmor', 'fmeq'):
+        # The other flag tests name their destination; the MAC ones also read a mask register.
+        for n, t in enumerate(ops):
+            r = reg(t, mask)
+            if r and r[0] != 'VI00':
+                (writes if n == 0 else reads).append((r[0], 'x'))
+    elif op in ('fcset', 'fsset'):
+        pass
     elif op in ('div', 'sqrt', 'rsqrt', 'clipw') or ops[:1] == ['ACC']:
         for t in ops:
             r = reg(t, mask)
@@ -198,12 +214,14 @@ def operands(text):
                 reads.append(r)
     else:
         # First operand written, the rest read. A memory operand's base is a read.
+        # mr32 rotates: each written lane comes from the next one of the source.
+        source_lanes = ''.join(MR32_SOURCE[l] for l in mask) if op == 'mr32' else mask
         if ops:
             d = reg(ops[0], mask)
             if d and d[0] not in ('VI00', 'VF00'):
                 writes.append((d[0], mask if d[0].startswith('VF') else 'x'))
             for t in ops[1:]:
-                r = reg(t, mask)
+                r = reg(t, source_lanes)
                 if r and r[0] not in ('VI00', 'VF00'):
                     reads.append(r)
     return reads, writes, mask
