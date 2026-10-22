@@ -547,8 +547,10 @@ def check_branches(prog):
         return [f"no .vutext section in {prog.obj}"], None
     bad, far, seen = [], 0, 0
     for pc in range(len(code) // 8):
-        lower, = struct.unpack_from('<I', code, pc * 8)
-        if (lower >> 25) not in BRANCH_OPCODES:
+        lower, upper = struct.unpack_from('<II', code, pc * 8)
+        # With the I bit set the lower word is LOI's immediate, not an instruction:
+        # 128.0 is 0x43000000, whose top bits spell bal.
+        if upper & 0x80000000 or (lower >> 25) not in BRANCH_OPCODES:
             continue
         seen += 1
         imm = lower & 0x7FF
