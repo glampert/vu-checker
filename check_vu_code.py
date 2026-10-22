@@ -10,7 +10,7 @@ of them did, and the symptom reached the screen rather than the build log:
   regalloc    openvcl's register allocation, proven by reaching definitions
   loopvar     a loop counter openvcl hands to a temporary
   immediates  an immediate dvp-as truncates to its field width
-  latency     a clip flag or Q read openvcl did not pad across a branch
+  latency     a flag, Q or branch-condition read openvcl did not pad across a branch
   branches    a branch offset dvp-as wrapped, decoded from the object
 
 A program is named by its object, and the checks read the build products the
@@ -429,25 +429,49 @@ def check_immediates(prog):
 #  latency
 # ---------------------------------------------------------------------------
 
+# The upper instructions that set the MAC and status flags (VU User's Manual 3.3.5):
+# the arithmetic ones, with their accumulator, broadcast, I and Q forms. abs, max,
+# mini, ftoi, itof and clip leave them alone.
+MAC_WRITER = re.compile(r'(add|sub|mul|madd|msub)a?[xyzwiq]?|opmula|opmsub')
+
 # (what produces it, what reads it, cycles until it lands)
 LATENCIES = {
-    'clip flags': (lambda op: op == 'clipw',
-                   lambda op: op in ('fcand', 'fcor', 'fceq', 'fcget'),
-                   4),
-    'Q':          (lambda op: op in ('div', 'sqrt', 'rsqrt'),
-                   lambda op: re.fullmatch(r'(add|sub|mul|madd|msub|adda|suba|mula|madda|msuba)q', op) is not None,
-                   7),
+    'clip flags':   (lambda op: op == 'clipw',
+                     lambda op: op in ('fcand', 'fcor', 'fceq', 'fcget'),
+                     4),
+    'MAC flags':    (lambda op: MAC_WRITER.fullmatch(op) is not None,
+                     lambda op: op in ('fmand', 'fmor', 'fmeq'),
+                     4),
+    'status flags': (lambda op: MAC_WRITER.fullmatch(op) is not None,
+                     lambda op: op in ('fsand', 'fsor', 'fseq'),
+                     4),
+    'Q':            (lambda op: op in ('div', 'sqrt', 'rsqrt'),
+                     lambda op: re.fullmatch(r'(add|sub|mul|madd|msub|adda|suba|mula|madda|msuba)q', op) is not None,
+                     7),
 }
+
+# Integer results land in one cycle, but a conditional branch tests its registers a
+# stage early and misses the instruction right before it (VU User's Manual 3.4.8).
+# The flag tests are the exception the manual makes; loads are interlocked.
+CONDITION_SETTERS = {'iadd', 'iaddi', 'iaddiu', 'isub', 'isubiu', 'iand', 'ior', 'mtir', 'xtop', 'xitop'}
 
 def check_latency(prog):
     """Check that no VU read of a pipelined result can land before the result does.
 
-    Two VU results arrive late and are read without an interlock: the clip flags,
-    four cycles after a clipw, and the Q register, seven after a div (sqrt, rsqrt).
-    Read early, they give the *previous* value, silently. openvcl pads for both -
-    but only within a basic block. Across a branch or a label it does not look, so
-    a read that is safe in one block becomes unsafe the moment control flow moves
-    between it and its producer.
+    A few VU results arrive late and are read without an interlock: the clip
+    flags, four cycles after a clipw, the MAC and status flags, four after the
+    arithmetic that sets them, and the Q register, seven after a div (sqrt,
+    rsqrt). Read early, they give the *previous* value, silently. (A register
+    read is safe: the VU stalls until a VF or VI result lands, so a short
+    distance there costs cycles, not correctness.) openvcl pads for all of them
+    - but only within a basic block. Across a branch or a label it does not
+    look, so a read that is safe in one block becomes unsafe the moment control
+    flow moves between it and its producer.
+
+    One more read is early by design: a conditional branch tests its registers a
+    stage before the instruction right before it writes them, so an integer
+    result tested by the very next instruction is not seen (VU User's Manual
+    3.4.8), unless that instruction is a flag test; a load would stall instead.
 
     That is how the lerp merge broke world clipping. The fcand judging a triangle
     moved behind the join of the two vertex-format blocks, two cycles after the last
@@ -458,36 +482,76 @@ def check_latency(prog):
     So this rebuilds the scheduled program's control flow (delay slots included,
     see successors()) and, for every read of the clip flags or Q, finds the
     shortest path back to a producer along any route. A waitq on the way satisfies
-    a Q read. Anything nearer than the latency fails.
+    a Q read. It also holds everything after it until Q lands, seven cycles after
+    the div it waits for, which puts the instructions before it that much further
+    from a flag read: a clipw paired with a div, then a waitq, then an fcand reads
+    flags seven cycles old, not two. Anything nearer than the latency fails.
     """
     pairs = parse(prog.vsm)
     n = len(pairs)
     preds = predecessors(successors(pairs))
 
     ops = [[split_op(upper)[0], split_op(lower)[0]] for _, _, upper, lower, _ in pairs]
+    produces_q = LATENCIES['Q'][0]
     bad = []
 
     for resource, (produces, reads, latency) in LATENCIES.items():
         for u in range(n):
-            if not any(reads(op) for op in ops[u]) or 'waitq' in ops[u]:
+            if not any(reads(op) for op in ops[u]) or (resource == 'Q' and 'waitq' in ops[u]):
                 continue
-            # Walk back from the reader. A producer in the reader's own pair does not count:
-            # the pair reads before it writes.
-            nearest, seen, stack = None, {}, [(p, 1) for p in preds[u]]
+            # Walk back from the reader, one state per path: the pair, its distance in
+            # issue slots, the stall the waitqs crossed so far add to that, the distance of
+            # a waitq whose stall is not sized yet (its div is further back), and that of a
+            # producer found since, which waits for the stall to be sized. A producer in the
+            # reader's own pair does not count: the pair reads before it writes.
+            nearest, seen = None, set()
+            stack = [(p, 1, 0, None, None) for p in preds[u]]
             while stack:
-                i, d = stack.pop()
-                if d >= latency or seen.get(i, latency) <= d:
+                state = stack.pop()
+                if state in seen:
                     continue
-                seen[i] = d
+                seen.add(state)
+                i, d, stall, waitq_at, pending = state
                 if resource == 'Q' and 'waitq' in ops[i]:
                     continue
-                if any(produces(op) for op in ops[i]):
-                    nearest = d if nearest is None else min(nearest, d)
-                    continue
-                stack += [(p, d + 1) for p in preds[i]]
+                if waitq_at is not None and any(produces_q(op) for op in ops[i]):
+                    stall += max(0, 6 - (d - waitq_at))
+                    waitq_at = None
+                    if pending is not None:
+                        nearest = pending + stall if nearest is None else min(nearest, pending + stall)
+                        continue
+                if waitq_at is None and resource != 'Q' and 'waitq' in ops[i]:
+                    waitq_at = d
+                if waitq_at is None:
+                    if d + stall >= latency:
+                        continue
+                    if any(produces(op) for op in ops[i]):
+                        nearest = d + stall if nearest is None else min(nearest, d + stall)
+                        continue
+                else:
+                    if pending is None and d + stall < latency and any(produces(op) for op in ops[i]):
+                        pending = d
+                    if pending is None and d + stall >= latency:
+                        continue
+                    if d - waitq_at >= 6 or not preds[i]:
+                        # no div within reach of the waitq: it stalls for nothing
+                        if pending is not None:
+                            nearest = pending + stall if nearest is None else min(nearest, pending + stall)
+                        continue
+                stack += [(p, d + 1, stall, waitq_at, pending) for p in preds[i]]
             if nearest is not None:
                 bad.append(f"instruction {u} reads the {resource} {nearest} cycle(s) after it is "
                            f"produced on some path; it lands after {latency}")
+
+    for u, (_, _, _, lower, _) in enumerate(pairs):
+        op, _, tested = split_op(lower)
+        if op not in BRANCHES or op in UNCONDITIONAL:
+            continue
+        for p in preds[u]:
+            setter, _, set_ops = split_op(pairs[p][3])
+            if setter in CONDITION_SETTERS and set_ops and set_ops[0] in tested and set_ops[0] != 'VI00':
+                bad.append(f"instruction {u} ({op}) tests {set_ops[0]} right after instruction {p} ({setter}) "
+                           f"sets it on some path; the branch sees the value from before")
     return bad, None
 
 # ---------------------------------------------------------------------------

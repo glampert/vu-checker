@@ -13,7 +13,7 @@ result in misallocation of registers and other syntactically valid but broken co
 - `regalloc`:    `openvcl`'s register allocation, proven by reaching definitions
 - `loopvar`:     a loop counter `openvcl` hands to a temporary
 - `immediates`:  an immediate `dvp-as` truncates to its field width
-- `latency`:     a clip flag or Q read `openvcl` did not pad across a branch
+- `latency`:     a flag, Q or branch-condition read `openvcl` did not pad across a branch
 - `branches`:    a branch offset `dvp-as` wrapped, decoded from the object
 
 `check_vu_code.py` itself contains detailed documentation for each check.
